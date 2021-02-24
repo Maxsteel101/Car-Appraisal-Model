@@ -1,0 +1,337 @@
+---
+title: "Car Appraisal App Mini Project"
+author: "Max Kofsky"
+date: "13/11/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#install.packages("data.table")
+#install.packages("dplyr")
+#install.packages("shiny")
+#install.packages("httr")
+#install.packages("jsonlite")
+#install.packages("ggplot2")
+#install.packages("shinythemes")
+
+
+library(data.table)
+library(dplyr)
+library(shiny)
+library(httr)
+library(jsonlite)
+library(ggplot2)
+library(shinythemes)
+```
+
+**Introduction**
+
+The objective of this project is to create a prediction algorithm that could give that value of a new car at auction. Many used cars that we see on lots and dealership are acquired through online auction platforms.The way dealers make money on these cars is by flipping the car for a greater value in their area or by fixing moderately damaged cars or salvage title vehicles. The idea of this tool is to let a lot owner estimate the value of a car at auction to determine a maximum ceiling for their bid so that they can obtain undervalued vehicles that they will then hopefully profit on.
+
+Another use case for this project would be DIY car enthusiasts who want to be able to find undervalued cars, particularly salvage vehicles, and fix them up to make a profit. Again, this tool would help them optimize their bid and not pay too much for vehicles. 
+
+Thus, the main question we are investigating is how does the type of car affect the sale price at auction and how can this information be used to give a competitive edge?
+
+To begin I found a dataset from kaggle that consisted of scrapped online auction data for cars. I though this would be a good base for the prediction model because it incorporates the real world selling prices of the cars and not just the posted value of a car like on auto classifieds. The csv is then loaded into the r environment using the fread function from the data.table package, this was mostly for the purpose of speed.
+
+Data Source: https://www.kaggle.com/doaaalsenani/usa-cers-dataset
+
+```{r}
+#Load car auction data into the environment
+auction.cars <- fread("USA_cars_datasets.csv")
+
+auction.cars
+```
+
+As you can see the original dataset has some flaws that need to be cleaned up first. There are strange model names like "door" and "doors", which do not exist. The color category also has far too many factors because of all the unique color names of cars. In the next section we will be cleaning up that data using an external data source and standardizing to the most popular vehicle colors.
+
+
+**Scraping Data from the National Highway Transportation Safety Administration**
+
+The data had a couple of issues and needed to be cleaned up. The first was that the models of these cars were not accurate which makes a huge difference in what car you are predicting the value of. As you can see from the data preview above, some car models are denoted as "door" or "doors" which aren't models. To fix this data, I created a custom function that uses the National Highway Transportation and Safety Administration vPic to retrieve information on a certain VIN number. These VIN numbers were provided in the original data set.
+
+NHTSA API Information: https://vpic.nhtsa.dot.gov/api/
+
+```{r}
+#Create a function to retrieve model on vin number from NHTSA vPic database
+
+vin.model <- function(vin, interval){
+  vin.lookup <- paste0('https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/',vin,'?format=json')
+  
+  requested.vin <- httr::GET(vin.lookup)
+  requested.vin <- suppressMessages(httr::content(requested.vin, as = "text"))
+  vin.info <- jsonlite::fromJSON(requested.vin)
+  vin.info <- as.data.frame(vin.info)
+  
+  car.model <- vin.info$Results.Model
+  car.model <- tolower(car.model)
+  
+  #The interval argument comes in here in case the API does not like all of the rapid request, the interval between requests is measured in seconds
+  Sys.sleep(interval)
+  return(car.model)
+}
+```
+
+The function works by connecting to the url for the API and downloading a JSON data file that contains many attributes on the Vin we are looking for. We then select the model name from that data frame of results. To handle the http request to the vPic API, I am using the httr package. Then to parse the json file that is returned from that request, I am using the jsonlite package.
+
+
+This loop was created to go through each vin number in the data set and overwrite the model with that official model name from the NHTSA. This loops took a very long time to finish, a couple of hours, due to the speed of the NHTSA API. THe loop was successfully completed. A cleaned data file has been provided that will be loaded for the linear model for the purpose of time. The file is "clean.auction.data.csv".
+
+```{r}
+#Loop to scrape the correct model name based on the vin
+#This loop takes a while to run given the speed of the API, it will complete in around 20 minutes when the progress bar reaches the end of the consoles
+
+vin.scrape.progress <- txtProgressBar(min = 0, max = nrow(auction.cars), initial = 0)
+
+for(i in 1:nrow(auction.cars)){
+  auction.cars$model[i] <- vin.model(vin = auction.cars$vin[i], interval = 0)
+  setTxtProgressBar(vin.scrape.progress, i)
+}   
+
+#auction.cars
+```
+
+```{r}
+auction.cars.clean <- auction.cars
+
+```
+
+In this cleaning section, the colors of the dataset are fixed. Each of the unique colors that used to be there will be replaced by one of the most popular colors or "other". This was in an effort to simplify the colors and get greater predictive power from the model later on. In the loop, each character entry in the color column is search for all of the popular colors and replaced with its matching standardized color string.
+
+```{r}
+#Clean color column of data for model
+
+popular.colors <- c("white", "silver", "black", "gray", "blue", "red", "brown", "green")
+excluded.entries <- c()
+
+for(i in 1:length(popular.colors)){
+  
+  color.match <- grep(pattern = popular.colors[i], auction.cars.clean$color)
+
+  auction.cars.clean[color.match, "color"] = popular.colors[i]
+  
+}
+
+auction.cars.clean[grepl("white|silver|black|gray|blue|red|brown|green", auction.cars.clean$color) == FALSE, "color"] = "other"
+
+auction.cars.clean
+```
+
+
+```{r}
+#Cleaned auction data is saved so that the vin lookup loop does not need to be executed again.
+write.csv(auction.cars.clean, file = "clean.auction.data.csv")
+
+```
+
+**Creating the Regression Model**
+
+```{r}
+#Load cleaned data if you want to skip the scrapping loop for NHTSA
+#This is a stepped that can be used to skip the NHTSA scraping loop with the extra file provided "clean.auction.data.csv"
+
+#auction.cars.clean <- fread(input = "clean.auction.data.csv")
+```
+
+Only relevant fields to the value of the car were used in the prediction model. Fields like the days to completion of the auction, lot number and index value are removed because they are unique identifiers that won't help in the predictive power of the model.
+
+```{r}
+#Isolate relevant data for creating a regression model
+auction.cars.model.data <- auction.cars.clean[,c("price", "brand", "model", "year", "title_status", "mileage", "color", "state")]
+
+auction.cars.model.data
+
+```
+
+A linear model is created to predict price based on all of the other attributes.
+
+```{r}
+#Linear model created predicting price with all other variable
+
+fit.cars <- lm(price ~ ., data = auction.cars.model.data)
+
+```
+
+According to the summary of the model fit to the auction car data, the model has fairly high predictive power with an R-Squared value of 0.7852. The p-value is also very small which suggest that we can reject the null hypothesis that a car's value is not determined by the type of car and the condition of the car.
+
+```{r}
+summary(fit.cars)
+```
+
+**Building the Shiny Web App**
+
+This web app was created so that a user can interact with the regression model we have created and put in different cars to be appraised by the model. The web app was created using the Shiny package. There are two main components to creating a Shiny application. First, the User Interface, which will be the selectors or text boxes displayed on your web page that the user can manipulate. Second, the server, is the information that is calculated and displayed to the user when the manipulate the controls of the app. In the case of our app, we will be calculating and displaying the output from our model as well as some visuals to aid the user in their car research process.
+
+First, we have several select inputs that data needs to be segregated for. This requires finding the unique factors of our categorical variables.
+
+```{r}
+#Data inside selector menus
+
+brand.selector <- unique(auction.cars.model.data$brand)
+
+model.selector <- unique(auction.cars.model.data$model)
+
+year.selector <- unique(auction.cars.model.data$year)
+
+title.selector <- unique(auction.cars.model.data$title_status)
+
+color.selector <- unique(auction.cars.model.data$color)
+
+state.selector <- unique(auction.cars.model.data$state)
+```
+
+The following is the User Interface Structure for the Shiny Application. There are seven user inputs in the side bar to specify the kind of car you want to appraise. The output of the interface is in the main panel and consists of the output of the prediction model in plain text and a plot that does a sensitivity analysis by state and displays the prediction values in each state on a reactive ggplot. To theme the UI, I am using the shinythemes package to modify this fluid page element.
+
+```{r}
+ui <- fluidPage(theme = shinytheme("cerulean"),
+
+  # App title ----
+  titlePanel("Car Appraisal"),
+
+  # Sidebar layout with input and output definitions ----
+  sidebarLayout(
+
+    # Sidebar panel for inputs ----
+    sidebarPanel(
+
+      # Input: Selectors and numeric input of each prediction data point ----
+      selectInput(inputId = "brand",
+                  label = "Make:",
+                  choices = brand.selector),
+      
+      selectInput(inputId = "model",
+                  label = "Model:",
+                  choices = NULL ),
+      #Set to null because it will be updated by the server depending on the chosen brand.
+      
+      numericInput(inputId = "year",
+                   label = "Year:",
+                  value = 2015, min = min(auction.cars.model.data$year),
+                  max = max(auction.cars.model.data$year)),
+      
+      selectInput(inputId = "title",
+                   label = "Title Status:",
+                  choices = title.selector),
+      
+      numericInput(inputId = "mileage",
+                   label = "Mileage:", value = 100000),
+      
+      selectInput(inputId = "color",
+                   label = "Color:",
+                  choices = color.selector),
+      
+      selectInput(inputId = "state",
+                   label = "State of Origin:",
+                  choices = state.selector),
+
+    ),
+
+    # Main panel for displaying outputs ----
+    mainPanel(
+
+      # Output: Prediction value of the model
+      h3(textOutput(outputId = "prediction.output")),
+      
+      # Output: Interactive Plot for States
+      plotOutput(outputId = "state.sensitivity", width = "100%", height = "500px"),
+      
+      plotOutput(outputId = "color.sensitivity", width = "100%", height = "500px")
+
+    )
+  )
+)
+```
+
+The following section is the server of the web app and it tells the UI what output to display based on the given outputs. The output is calculated by the server and stored in output$prediction output which then is displayed in the UI. Also in this server is a reactive UI element that I created. I wanted to make it so that a user could not put a mismatched make and model, so the results in the model selection input need to be filtered. 
+
+The first part was creating a reactive element that filters the data for the select input choices based on the brand put in by the user. This event is then observed and when it occurs the choices of the select input UI is updated. 
+
+The second part calculates the value of the car the user had put in based in the linear model above. 
+
+The third section is a loop that calculates the prediction for a car in each state and plots that to a ggplot bar graph. The purpose of this visualization is to give the buyer a better idea of what a car is worth in their local market. For example, trucks are more valuable is western states and less valuable in dense east coast states. The plot is reactive so whenever you change a parameter of your prediction, like the "Title Status", the predictions on the plot will adjust.
+
+The last loop in the server or for a similar plot to the last one only this time we are looking at how different colors would impact the value of the vehicle we are looking to appraise.
+
+```{r}
+server <- function(input, output, session) {
+
+  # Return the requested prediction ----
+  
+  #Create a reactive function to filter the car models based on the selected brand
+  chosen.brand <- reactive({
+    filter.model <- filter(auction.cars.model.data, brand == input$brand)
+  })
+  
+  #Update the model select input to reflect the filters models for choices
+  observeEvent(chosen.brand(), {
+    choices <- unique(chosen.brand()$model)
+    updateSelectInput(session, "model", choices = choices)
+  })
+
+  #Uses linear model to generate a predicted value for the provided car
+  output$prediction.output <- renderText({
+    input.car <- data.frame(brand = input$brand, model = input$model, year = input$year, title_status = input$title, 
+                            mileage = input$mileage, color = input$color, state = input$state)
+    
+    prediction <- suppressWarnings(predict(fit.cars, input.car))
+    
+    paste("Your", input$brand, input$model, "is valued at $", round(prediction, 2))
+  })
+  
+  #Loop to produce state sensitivity analysis for state values
+  
+  output$state.sensitivity <- renderPlot({
+    
+  states <- unique(auction.cars.model.data$state)
+  predict.out <- numeric(0)
+  
+  for(i in 1:length(states)){
+    sense.input <- data.frame(brand = input$brand, model = input$model, year = input$year, title_status = input$title, 
+                            mileage = input$mileage, color = input$color, state = states[i])
+    predict.out[i] <- predict(fit.cars, sense.input)
+  }
+  
+  plot.data <- data.frame(states,predict.out)
+    
+    ggplot(data = plot.data, aes(x = predict.out, y = states))+geom_bar(stat = "identity", fill = "steelblue")+xlab("Predicted Value")+ylab("States")
+  })
+  
+  #Loop to produce sensitivity analysis for color
+  
+  output$color.sensitivity <- renderPlot({
+     
+  car.colors <- unique(auction.cars.model.data$color)
+  predict.out2 <- numeric(0)
+  
+  for(i in 1:length(car.colors)){
+    sense2.input <- data.frame(brand = input$brand, model = input$model, year = input$year, title_status = input$title, 
+                            mileage = input$mileage, color = car.colors[i], state = input$state)
+    predict.out2[i] <- predict(fit.cars, sense2.input)
+  }
+  
+  plot2.data <- data.frame(car.colors,predict.out2)
+    
+    ggplot(data = plot2.data, aes(x = predict.out2, y = car.colors))+geom_bar(stat = "identity", fill = "steelblue")+xlab("Predicted Value")+ylab("Colors")
+  })
+  
+}  
+```
+
+This function compiles the ui and server elements created in the last section and deploys the web app within a browser window.
+
+```{r}
+shinyApp(ui, server)
+
+```
+**Concluding Remarks**
+
+The end product of this mini project is a small and useful app for appraising the value of cars. The tool would be useful for dealer looking at cars at auction and even DIY enthusiasts who would want to buy cheap cars at auction, fix them and flip them for a profit. The model has moderate predictive power so it should be fairly accurate in depicting the market value of a car, which will aid the users in tailoring their bids for these online auctions.
+
+Additional insights made were that where the car is being sold is extremely important. Large cars, like a ford f-150, we worth more in place like Montana and Wyoming than New York. Likely due to the use cases for this kind of vehicle in each of those place. We also learned from our visual aids that cars with exotic colors are typically worth more. This is likely because of its association with high end automobiles.
+
+This application also has some limitations. I believe more auction data from multiple auction houses would greatly improve the accuracy of this model. However, during the course of this project it proved difficult to find publicly available sources of up to date auction data. Additionally, the API to access data from the NHTSA was very slow which creates some problem in real world use. A quicker way to access the data from the vPic database would be needed or at least a cached copy of the data so that it could be accessed quicker. Lastly, sometimes the model can produce negative predictions which isn't entirely possible given the asset, however it would indicate a particular car has little value outside of scrap.
+
+
+   
